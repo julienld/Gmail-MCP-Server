@@ -206,11 +206,18 @@ const SendEmailSchema = z.object({
 
 const ReadEmailSchema = z.object({
     messageId: z.string().describe("ID of the email message to retrieve"),
+    format: z.enum(['full', 'metadata', 'text_only']).optional().default('full').describe("Format of the email content to return"),
+});
+
+const ReadThreadSchema = z.object({
+    threadId: z.string().describe("ID of the email thread to retrieve"),
+    format: z.enum(['full', 'metadata', 'latest']).optional().default('full').describe("Format of the thread content to return"),
 });
 
 const SearchEmailsSchema = z.object({
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
     maxResults: z.number().optional().describe("Maximum number of results to return"),
+    pageToken: z.string().optional().describe("Token to retrieve the next page of results"),
 });
 
 // Updated schema to include removeLabelIds
@@ -357,6 +364,11 @@ async function main() {
                 name: "read_email",
                 description: "Retrieves the content of a specific email",
                 inputSchema: zodToJsonSchema(ReadEmailSchema),
+            },
+            {
+                name: "read_thread",
+                description: "Retrieves an entire email thread with configurable detail level",
+                inputSchema: zodToJsonSchema(ReadThreadSchema),
             },
             {
                 name: "search_emails",
@@ -607,10 +619,14 @@ async function main() {
 
                 case "read_email": {
                     const validatedArgs = ReadEmailSchema.parse(args);
+                    const format = validatedArgs.format || 'full';
+                    
+                    const apiFormat = format === 'metadata' ? 'metadata' : 'full';
+                    
                     const response = await gmail.users.messages.get({
                         userId: 'me',
                         id: validatedArgs.messageId,
-                        format: 'full',
+                        format: apiFormat,
                     });
 
                     const headers = response.data.payload?.headers || [];
@@ -619,17 +635,30 @@ async function main() {
                     const to = headers.find(h => h.name?.toLowerCase() === 'to')?.value || '';
                     const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || '';
                     const threadId = response.data.threadId || '';
+                    const snippet = response.data.snippet || '';
+
+                    let contentText = `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\nSnippet: ${snippet}\n`;
+
+                    if (format === 'metadata') {
+                        return {
+                            content: [{ type: "text", text: contentText }]
+                        };
+                    }
 
                     // Extract email content using the recursive function
                     const { text, html } = extractEmailContent(response.data.payload as GmailMessagePart || {});
 
-                    // Use plain text content if available, otherwise use HTML content
-                    // (optionally, you could implement HTML-to-text conversion here)
-                    let body = text || html || '';
+                    let body = '';
+                    let contentTypeNote = '';
 
-                    // If we only have HTML content, add a note for the user
-                    const contentTypeNote = !text && html ?
-                        '[Note: This email is HTML-formatted. Plain text version not available.]\n\n' : '';
+                    if (format === 'text_only') {
+                        body = text || '(No plain text content available)';
+                        if (!text && html) contentTypeNote = '[Note: Email contains only HTML content, which was suppressed by text_only format]\n';
+                    } else {
+                        // Full format
+                        body = text || html || '';
+                        if (!text && html) contentTypeNote = '[Note: This email is HTML-formatted. Plain text version not available.]\n';
+                    }
 
                     // Get attachment information
                     const attachments: EmailAttachment[] = [];
@@ -655,7 +684,6 @@ async function main() {
                         processAttachmentParts(response.data.payload as GmailMessagePart);
                     }
 
-                    // Add attachment info to output if any are present
                     const attachmentInfo = attachments.length > 0 ?
                         `\n\nAttachments (${attachments.length}):\n` +
                         attachments.map(a => `- ${a.filename} (${a.mimeType}, ${Math.round(a.size/1024)} KB, ID: ${a.id})`).join('\n') : '';
@@ -664,9 +692,62 @@ async function main() {
                         content: [
                             {
                                 type: "text",
-                                text: `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`,
+                                text: `${contentText}\n${contentTypeNote}\n${body}${attachmentInfo}`,
                             },
                         ],
+                    };
+                }
+
+                case "read_thread": {
+                    const validatedArgs = ReadThreadSchema.parse(args);
+                    const format = validatedArgs.format || 'full';
+
+                    const response = await gmail.users.threads.get({
+                        userId: 'me',
+                        id: validatedArgs.threadId,
+                        format: 'full', // Always fetch full to have option to process bodies
+                    });
+
+                    const messages = response.data.messages || [];
+                    
+                    if (messages.length === 0) {
+                        return { content: [{ type: "text", text: "Thread is empty." }] };
+                    }
+
+                    let threadOutput = `Thread ID: ${response.data.id} (${messages.length} messages)\n\n`;
+
+                    for (let i = 0; i < messages.length; i++) {
+                        const msg = messages[i];
+                        const isLatest = i === messages.length - 1;
+                        
+                        const headers = msg.payload?.headers || [];
+                        const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
+                        const from = headers.find(h => h.name?.toLowerCase() === 'from')?.value || '';
+                        const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || '';
+                        const snippet = msg.snippet || '';
+
+                        threadOutput += `--- Message ${i + 1} ---\n`;
+                        threadOutput += `From: ${from}\nDate: ${date}\nSubject: ${subject}\nSnippet: ${snippet}\n`;
+
+                        // Determine if we should show the full body
+                        let showBody = false;
+                        if (format === 'full') showBody = true;
+                        if (format === 'latest' && isLatest) showBody = true;
+
+                        if (showBody) {
+                            const { text, html } = extractEmailContent(msg.payload as GmailMessagePart || {});
+                            const body = text || html || '(No content)';
+                            threadOutput += `\nBody:\n${body}\n`;
+                        } else {
+                            if (format !== 'metadata') {
+                                threadOutput += `\n(Body omitted for brevity)\n`;
+                            }
+                        }
+                        threadOutput += `\n`;
+                    }
+
+                    return {
+                        content: [{ type: "text", text: threadOutput }]
                     };
                 }
 
@@ -676,6 +757,7 @@ async function main() {
                         userId: 'me',
                         q: validatedArgs.query,
                         maxResults: validatedArgs.maxResults || 10,
+                        pageToken: validatedArgs.pageToken,
                     });
 
                     const messages = response.data.messages || [];
@@ -693,17 +775,24 @@ async function main() {
                                 subject: headers.find(h => h.name === 'Subject')?.value || '',
                                 from: headers.find(h => h.name === 'From')?.value || '',
                                 date: headers.find(h => h.name === 'Date')?.value || '',
+                                snippet: detail.data.snippet || '',
                             };
                         })
                     );
+
+                    let responseText = results.map(r =>
+                        `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\nSnippet: ${r.snippet}\n`
+                    ).join('\n');
+
+                    if (response.data.nextPageToken) {
+                        responseText += `\n--- Next Page ---\nThere are more results available. To see them, perform the search again with the following tool call:\nsearch_emails(query='${validatedArgs.query}', pageToken='${response.data.nextPageToken}')`;
+                    }
 
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: results.map(r =>
-                                    `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\n`
-                                ).join('\n'),
+                                text: responseText,
                             },
                         ],
                     };
